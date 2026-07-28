@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Runtime data
+.forge-mcp/
+
+# Local MPM analysis artifacts
+.mpm-data/
+_MPM_PROJECT_RULES.md
+visualize_history.py
+project_timeline.html
+dev-log.md
+dev-log-archive/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

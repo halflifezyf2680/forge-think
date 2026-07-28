@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "forge-think": {
+      "command": "python",
+      "args": ["/absolute/path/to/forge-think/server.py"]
+    }
+  }
+}

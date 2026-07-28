@@ -1,0 +1,9 @@
+{
+  "mcp": {
+    "forge-think": {
+      "type": "local",
+      "command": ["python", "/absolute/path/to/forge-think/server.py"],
+      "enabled": true
+    }
+  }
+}
