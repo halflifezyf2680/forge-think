@@ -30,3 +30,6 @@ dev-log-archive/
 # OS
 .DS_Store
 Thumbs.db
+
+# Dev-SSOT
+Dev-SSOT/
