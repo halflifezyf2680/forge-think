@@ -106,6 +106,7 @@ class ForgeStartInput(BaseModel):
     sop: Optional[str] = Field(None, description="[chain] 已存 SOP 的 name,从库加载 steps(与 steps 二选一)。不知道名字时必须先调 forge_sop_list 查候选,再把匹配的 name 传入此字段")
     baseline_role: Optional[str] = Field(None, description="[deliberate·必填] 生成基线初稿的角色")
     lenses: Optional[List[Lens]] = Field(None, description="[deliberate·必填] 审查视角数组")
+    rounds: Optional[int] = Field(2, description="[deliberate] 圆桌辩论轮数，默认 2 轮(第1轮各自初审，第2轮交叉反驳与妥协，最后总收敛)")
 
     @model_validator(mode="after")
     def _check_mode_params(self):
@@ -216,7 +217,7 @@ _install_default_sops()
 # ───────────────────────── step 构造 ─────────────────────────
 
 def _build_steps(params: ForgeStartInput) -> List[dict]:
-    """按 mode 构造待执行 step 序列。每 step = {role, instruction, type}。"""
+    """按 mode 构造待执行 step 序列。每 step = {role, instruction, type, round}。"""
     if params.mode == "chain":
         steps = params.steps
         if params.sop:
@@ -228,24 +229,123 @@ def _build_steps(params: ForgeStartInput) -> List[dict]:
                 raise ValueError(f"SOP '{params.sop}' 没有 steps")
         if not steps:
             raise ValueError("chain 模式必须提供 steps 或 sop")
-        return [{"role": "专家", "instruction": s, "type": "step"} for s in steps]
+        return [{"role": "专家", "instruction": s, "type": "step", "round": 0} for s in steps]
 
     if params.mode == "deliberate":
-        seq = [{"role": params.baseline_role,
-                "instruction": "基于你的专业能力,针对任务直接产出一份高质量初步方案/文本,不要废话。",
-                "type": "baseline"}]
-        seq += [{"role": l.role, "instruction": l.instruction, "type": "lens"} for l in params.lenses]
+        rounds = params.rounds if (params.rounds and params.rounds >= 1) else 2
+        seq = [{
+            "role": params.baseline_role,
+            "instruction": "针对任务直接产出一份高质量初步基线方案/文本，作为后续圆桌专家辩论审议的基础，不要废话。",
+            "type": "baseline",
+            "round": 0
+        }]
+        for r in range(1, rounds + 1):
+            if r == 1:
+                for l in params.lenses:
+                    seq.append({
+                        "role": l.role,
+                        "instruction": f"【第 1 轮初审】立足你的人设，严苛审查基线方案，指出漏洞、隐患与修改建议：{l.instruction}",
+                        "type": "lens_critique",
+                        "round": 1
+                    })
+            else:
+                seq.append({
+                    "role": "圆桌主持人",
+                    "instruction": f"【第 {r} 轮争议梳理】综合上一轮各专家的所有交锋意见，明确指出方案存在的核心矛盾、冲突焦点与妥协空间，引导专家们展开交叉反驳。",
+                    "type": "moderator_triage",
+                    "round": r
+                })
+                for l in params.lenses:
+                    seq.append({
+                        "role": l.role,
+                        "instruction": f"【第 {r} 轮交叉反驳与妥协】审阅其他专家的异议与主持人梳理的争议点。立足你的人设再次思考：你坚持原有立场、反驳对方，还是同意折中？给出你的二次修正方案：{l.instruction}",
+                        "type": "lens_rebuttal",
+                        "round": r
+                    })
+        seq.append({
+            "role": params.baseline_role or "圆桌总主持",
+            "instruction": "【圆桌总收敛】各专家已完成充分交锋、交叉反驳与妥协。请综合全场达成的共识，消除所有逻辑漏洞与冲突，输出最终定版、全员统一的完整方案！",
+            "type": "final_synthesis",
+            "round": rounds + 1
+        })
         return seq
 
     if params.mode == "seq":
         role = params.role or "资深专家"
         return [{"role": role,
                  "instruction": "推演一步(可推翻重来、可改主意)。直接给出这一步的思考。",
-                 "type": "seq"}]
+                 "type": "seq",
+                 "round": 0}]
     raise ValueError(f"未知 mode: {params.mode}")
 
 
-def _step_response(session: dict, step: Optional[dict], done: bool, current_text: str = "") -> str:
+def _format_deliberate_context(session: dict, next_step: Optional[dict]) -> str:
+    """圆桌模式专属上下文组装：为每位发言专家提供基线方案与其他专家的交锋记录。"""
+    if not next_step:
+        return session["trace"][-1]["output"] if session.get("trace") else ""
+
+    stype = next_step.get("type")
+    baseline = session.get("baseline_text", "")
+
+    if stype == "baseline":
+        return f"任务目标: {session.get('task', '')}"
+
+    if stype == "lens_critique":
+        lines = [f"【基线方案 (Baseline)】:\n{baseline}"]
+        r1_traces = [t for t in session.get("trace", []) if t.get("round") == 1 and t.get("type") == "lens_critique"]
+        if r1_traces:
+            lines.append("【圆桌已发言专家初步审查意见】:")
+            for t in r1_traces:
+                lines.append(f"--- 专家「{t['role']}」---\n{t['output']}\n")
+        return "\n\n".join(lines)
+
+    if stype == "moderator_triage":
+        lines = [f"【基线方案 (Baseline)】:\n{baseline}"]
+        r_prev = next_step.get("round", 2) - 1
+        prev_traces = [t for t in session.get("trace", []) if t.get("round") == r_prev and t.get("type") in ("lens_critique", "lens_rebuttal")]
+        lines.append(f"【第 {r_prev} 轮各专家审查意见汇总】:")
+        for t in prev_traces:
+            lines.append(f"--- 专家「{t['role']}」---\n{t['output']}\n")
+        return "\n\n".join(lines)
+
+    if stype == "lens_rebuttal":
+        lines = [f"【基线方案 (Baseline)】:\n{baseline}"]
+        curr_round = next_step.get("round", 2)
+        mod_trace = [t for t in session.get("trace", []) if t.get("round") == curr_round and t.get("type") == "moderator_triage"]
+        if mod_trace:
+            lines.append(f"【主持人分歧归纳与争议议题】:\n{mod_trace[-1]['output']}")
+        other_traces = [t for t in session.get("trace", []) if t.get("round") == (curr_round - 1) and t.get("type") in ("lens_critique", "lens_rebuttal")]
+        if other_traces:
+            lines.append("【上一轮各专家异议详情】:")
+            for t in other_traces:
+                lines.append(f"--- 专家「{t['role']}」---\n{t['output']}\n")
+        rebut_traces = [t for t in session.get("trace", []) if t.get("round") == curr_round and t.get("type") == "lens_rebuttal"]
+        if rebut_traces:
+            lines.append("【本轮其他专家最新交叉表态】:")
+            for t in rebut_traces:
+                lines.append(f"--- 专家「{t['role']}」---\n{t['output']}\n")
+        return "\n\n".join(lines)
+
+    if stype == "final_synthesis":
+        lines = [f"【基线方案 (Baseline)】:\n{baseline}"]
+        lines.append("【圆桌多轮交叉辩论全记录】:")
+        for t in session.get("trace", []):
+            if t.get("type") != "baseline":
+                r_num = t.get("round", "")
+                r_prefix = f"[R{r_num}] " if r_num else ""
+                lines.append(f"--- {r_prefix}专家「{t['role']}」---\n{t['output']}\n")
+        return "\n\n".join(lines)
+
+    return session["trace"][-1]["output"] if session.get("trace") else ""
+
+
+def _step_response(session: dict, step: Optional[dict], done: bool, current_text: Optional[str] = None) -> str:
+    if current_text is None:
+        if session["mode"] == "deliberate":
+            current_text = _format_deliberate_context(session, step)
+        else:
+            current_text = session["trace"][-1]["output"] if session.get("trace") else ""
+
     resp = {
         "session_id": session["session_id"],
         "status": session["status"],
@@ -255,13 +355,40 @@ def _step_response(session: dict, step: Optional[dict], done: bool, current_text
         "current_text": current_text,
     }
     if step and not done:
-        resp["next_step"] = {"role": step["role"], "instruction": step["instruction"], "type": step["type"]}
-        resp["guidance"] = (
-            f"请以「{step['role']}」的身份,对上面的 current_text 执行:{step['instruction']}。"
-            f"完成后把结果作为 output 调用 forge_step。"
-        )
+        resp["next_step"] = {"role": step["role"], "instruction": step["instruction"], "type": step.get("type", "step")}
+        stype = step.get("type", "step")
+        if stype == "baseline":
+            resp["guidance"] = (
+                f"【圆桌基线初稿】请以「{step['role']}」的身份，针对任务直接产出一份高质量初步基线方案/文本，作为圆桌专家审议的基础。"
+                f"完成后把方案作为 output 调用 forge_step。"
+            )
+        elif stype == "lens_critique":
+            resp["guidance"] = (
+                f"【圆桌开会 · 独立初审】请以「{step['role']}」的身份，立足你的人设，严苛审查基线方案，指出漏洞与修改建议：{step['instruction']}。"
+                f"完成后把审阅意见作为 output 调用 forge_step。"
+            )
+        elif stype == "moderator_triage":
+            resp["guidance"] = (
+                f"【圆桌主持 · 争议归纳】综合审阅基线方案与以上各专家的所有挑刺意见，归纳出存在的冲突焦点、对立诉求与妥协空间，提出需要专家们在下一轮辩论中重点表态的议题。"
+                f"完成后把争议归纳作为 output 调用 forge_step。"
+            )
+        elif stype == "lens_rebuttal":
+            resp["guidance"] = (
+                f"【圆桌开会 · 交叉反驳与对齐】请以「{step['role']}」的身份，阅读其他专家的异议与主持人的争议归纳。用你的人设再次思考：你坚持原有立场、反驳对方，还是同意折中？给出你的二次修正方案：{step['instruction']}。"
+                f"完成后把反驳/妥协意见作为 output 调用 forge_step。"
+            )
+        elif stype == "final_synthesis":
+            resp["guidance"] = (
+                f"【圆桌总收敛】各专家已完成充分辩论、交叉反驳与妥协。请以「{step['role']}」的身份，综合全场共识，消除所有逻辑漏洞与冲突，输出最终定版、全员统一的完整方案！"
+                f"完成后把最终方案作为 output 调用 forge_step。"
+            )
+        else:
+            resp["guidance"] = (
+                f"请以「{step['role']}」的身份,对上面的 current_text 执行:{step['instruction']}。"
+                f"完成后把结果作为 output 调用 forge_step。"
+            )
     else:
-        resp["guidance"] = "淬炼完成。可调用 forge_review 复盘全过程。"
+        resp["guidance"] = "圆桌淬炼收敛完成。全员已达成统一共识。可调用 forge_review 复盘全过程。"
     return json.dumps(resp, ensure_ascii=False, indent=2)
 
 
@@ -275,16 +402,17 @@ HELP_TEXT = """forge-think — 多步对抗淬炼引擎(9 个 tool)
 【三模式 · 先选对模式】
   · seq        根因未知、路径未成形、可能随时推翻假设 → 同一专家沿发现逐步探索；不会自动 done，够了就 forge_stop。
   · chain      已有固定步骤、业务方法论或 SOP → 每一步基于上一轮完整产出继续更新；全部完成自动 done。
-  · deliberate 已有计划/设计/结论，需要不同立场挑漏洞并收敛 → 基线 + 多个 lens 依次改写；全部完成自动 done。
+  · deliberate 已有计划/设计/结论，需要不同立场交锋、质询并收敛 → 基线提案 + 独立挑刺 + 争议归纳 + 交叉反驳 + 总收敛统一；全部完成自动 done。
 
 【低摩擦内部 Grill】
-  grill-me 式用户访谈的低摩擦替代是 deliberate，不是 seq。对现有上下文、代码和约束已足够的问题，用 lens 自问自答：需求质询者 → 魔鬼代言人 → 落地审查员 → 信息边界审查员。
-  最后一位必须遵守:只能用已有证据收敛；无法确认且会改变方案的事项列为「需要用户确认」，不得猜测。
+  grill-me 式用户访谈的低摩擦替代是 deliberate，不是 seq。对现有上下文、代码和约束已足够的问题，用 lens 组成圆桌辩论：需求质询者 → 魔鬼代言人 → 落地审查员 → 信息边界审查员。
+  最后由总主持统一收敛必须遵守:只能用已有证据收敛；无法确认且会改变方案的事项列为「需要用户确认」，不得猜测。
   业务优先级、预算、用户偏好、授权范围、外部事实或不可逆决策只能由用户确认，必须明确提问，不能用内部 Grill 替代。
 
 【怎样构造高质量 lens】
-  每个 lens = 立场鲜明的 role + 具体可执行的 instruction。role 负责从哪个角度审，instruction 负责如何改写上一轮完整文本。
+  每个 lens = 立场鲜明的 role + 具体可执行的 instruction。role 负责从哪个角度挑刺与辩驳，instruction 负责指明审查方向。
   例:安全审查员(找注入/越权/数据泄露并修正) → 性能工程师(分析复杂度和资源占用并优化) → 极简 reviewer(删过度设计)。
+  deliberate 会自动组织多轮开会：专家独立挑刺 → 主持人梳理争议 → 专家针对争议交叉反驳/妥协 → 首席主持总收敛定稿。
   deliberate 的 baseline_role 和 lenses 是本次调用的临时圆桌，任意数量、任意顺序，当前不会自动保存。
 
 【SOP 库 · 业务定向方法论】
@@ -318,6 +446,7 @@ HELP_TEXT = """forge-think — 多步对抗淬炼引擎(9 个 tool)
     name="forge_help",
     annotations={"title": "forge-think 使用手册", "readOnlyHint": True, "destructiveHint": False,
                  "idempotentHint": True, "openWorldHint": False},
+    structured_output=False,  # 只走 text 单通道,禁用 structuredContent 重复载荷
 )
 async def forge_help() -> str:
     """forge-think 使用手册:触发词、何时用、三模式决策指南、SOP 库、调用流程。
@@ -331,6 +460,7 @@ async def forge_help() -> str:
     name="forge_start",
     annotations={"title": "启动淬炼 session", "readOnlyHint": False, "destructiveHint": False,
                  "idempotentHint": False, "openWorldHint": False},
+    structured_output=False,  # 只走 text 单通道,禁用 structuredContent 重复载荷
 )
 async def forge_start(params: ForgeStartInput) -> str:
     """启动一个淬炼 session,返回第一步要做什么。
@@ -344,9 +474,10 @@ async def forge_start(params: ForgeStartInput) -> str:
     - **chain**(自定义步骤链):固定管线,每步对上一步产出操作。
       传 steps(自定义步骤)或 sop(已存 SOP 的 name,从库加载)。跑完所有 step **自动 done**。
       适用:固定流程、跑沉淀的 SOP。
-    - **deliberate**(多视角 lens 迭代):多角色依次打磨同一份产出。
-      传 baseline_role + lenses(都必填)。baseline + 所有 lens 跑完 **自动 done**。
-      适用:代码审查、方案打磨、多对立立场。
+    - **deliberate**(圆桌开会辩论与收敛):多角色多轮交锋、质询与统一。
+      传 baseline_role + lenses(必填)，可选 rounds(默认2轮)。
+      流转: 基线提案 → 专家独立初审 → 主持人归纳争议 → 专家针对异议交叉反驳/妥协 → 首席主持全盘总收敛。跑完 **自动 done**。
+      适用:技术方案评审、架构权衡、多方对立诉求决策。
 
     host 拿到 next_step(角色+指令)后,自己以该身份生成产出,调 forge_step 提交,循环到 done。
 
@@ -367,6 +498,7 @@ async def forge_start(params: ForgeStartInput) -> str:
         "trace": [],
         "index": 0,
         "status": "running",
+        "baseline_text": "",
     }
     _SESSIONS[sid] = session
     _persist_session(session)
@@ -377,6 +509,7 @@ async def forge_start(params: ForgeStartInput) -> str:
     name="forge_step",
     annotations={"title": "提交产出并推进", "readOnlyHint": False, "destructiveHint": False,
                  "idempotentHint": False, "openWorldHint": False},
+    structured_output=False,  # 只走 text 单通道,禁用 structuredContent 重复载荷
 )
 async def forge_step(params: ForgeStepInput) -> str:
     """提交 host 这一回合的产出,记入 trace,推进到下一步。
@@ -393,11 +526,17 @@ async def forge_step(params: ForgeStepInput) -> str:
         return "Error: session 已完成,无需再推进"
 
     cur_step = s["steps"][0] if s["mode"] == "seq" else s["steps"][s["index"]]
-    s["trace"].append({
+    trace_item = {
         "role": cur_step["role"],
         "instruction": cur_step["instruction"],
         "output": params.output,
-    })
+        "type": cur_step.get("type", "step"),
+        "round": cur_step.get("round", 0),
+    }
+    s["trace"].append(trace_item)
+    if cur_step.get("type") == "baseline":
+        s["baseline_text"] = params.output
+
     s["index"] += 1
     _persist_session(s)
 
@@ -405,7 +544,10 @@ async def forge_step(params: ForgeStepInput) -> str:
         return _step_response(s, s["steps"][0], done=False, current_text=params.output)
 
     if s["index"] < len(s["steps"]):
-        return _step_response(s, s["steps"][s["index"]], done=False, current_text=params.output)
+        next_step = s["steps"][s["index"]]
+        if s["mode"] == "deliberate":
+            return _step_response(s, next_step, done=False)
+        return _step_response(s, next_step, done=False, current_text=params.output)
 
     s["status"] = "done"
     _persist_session(s)
@@ -416,6 +558,7 @@ async def forge_step(params: ForgeStepInput) -> str:
     name="forge_review",
     annotations={"title": "复盘淬炼过程", "readOnlyHint": True, "destructiveHint": False,
                  "idempotentHint": True, "openWorldHint": False},
+    structured_output=False,  # 只走 text 单通道,禁用 structuredContent 重复载荷
 )
 async def forge_review(params: ForgeSessionInput) -> str:
     """返回 session 的所有中间步(角色/指令/产出)+ 当前状态。用于复盘。"""
@@ -432,6 +575,7 @@ async def forge_review(params: ForgeSessionInput) -> str:
     name="forge_stop",
     annotations={"title": "终止淬炼 session", "readOnlyHint": False, "destructiveHint": False,
                  "idempotentHint": False, "openWorldHint": False},
+    structured_output=False,  # 只走 text 单通道,禁用 structuredContent 重复载荷
 )
 async def forge_stop(params: ForgeSessionInput) -> str:
     """强制终止 session(状态置 stopped)。已完成的步保留,可后续 forge_review 复盘。"""
@@ -453,6 +597,7 @@ async def forge_stop(params: ForgeSessionInput) -> str:
     name="forge_sop_save",
     annotations={"title": "创建/更新 SOP", "readOnlyHint": False, "destructiveHint": False,
                  "idempotentHint": False, "openWorldHint": False},
+    structured_output=False,  # 只走 text 单通道,禁用 structuredContent 重复载荷
 )
 async def forge_sop_save(params: ForgeSopSaveInput) -> str:
     """创建或更新一个 SOP(同名覆盖 = 编辑)。把踩坑经验/公司规定/项目约束沉淀成可复用流程。
@@ -491,6 +636,7 @@ async def forge_sop_save(params: ForgeSopSaveInput) -> str:
     name="forge_sop_list",
     annotations={"title": "列出 SOP", "readOnlyHint": True, "destructiveHint": False,
                  "idempotentHint": True, "openWorldHint": False},
+    structured_output=False,  # 只走 text 单通道,禁用 structuredContent 重复载荷
 )
 async def forge_sop_list(params: ForgeSopListInput) -> str:
     """列出 SOP(支持 category/tag/q 过滤)。用于选 SOP 时缩小范围,再由 host 选最合适的跑。
@@ -534,6 +680,7 @@ async def forge_sop_list(params: ForgeSopListInput) -> str:
     name="forge_sop_get",
     annotations={"title": "查看 SOP 详情", "readOnlyHint": True, "destructiveHint": False,
                  "idempotentHint": True, "openWorldHint": False},
+    structured_output=False,  # 只走 text 单通道,禁用 structuredContent 重复载荷
 )
 async def forge_sop_get(params: ForgeSopNameInput) -> str:
     """查看某 SOP 完整内容(含 steps)。编辑前先 get 看现状。"""
@@ -547,6 +694,7 @@ async def forge_sop_get(params: ForgeSopNameInput) -> str:
     name="forge_sop_delete",
     annotations={"title": "删除 SOP", "readOnlyHint": False, "destructiveHint": True,
                  "idempotentHint": False, "openWorldHint": False},
+    structured_output=False,  # 只走 text 单通道,禁用 structuredContent 重复载荷
 )
 async def forge_sop_delete(params: ForgeSopNameInput) -> str:
     """删除一个 SOP(不可恢复)。"""
